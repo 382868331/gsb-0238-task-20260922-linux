@@ -5,11 +5,14 @@
 
 * 自己做简单路径 DFS；
 * 自己按题面公式反向递推每条路径每跳账单；
+* 锁定增量同样独立地从收款端向源端反向累计；
 * 穷举 1..3 条路径的全部组合与全部正整数分拆；
 * 目标键 (源支付, 路径数, 路径节点元组, 分拆向量取负) 取字典序最小。
 
-图输入用裸元组 ``(src, dst, balance, base_fee, ppm)``，节点编号必须
-为连续的 ``0..n-1``（测试网络都满足），避免任何被测代码参与期望值。
+图输入用裸元组 ``(src, dst, balance, base_fee, ppm)`` 或带锁定增量的
+``(src, dst, balance, base_fee, ppm, lock_delta)``（缺省为 0），节点
+编号必须为连续的 ``0..n-1``（测试网络都满足），避免任何被测代码参与
+期望值。
 """
 
 from __future__ import annotations
@@ -23,6 +26,14 @@ def fee(x: int, b: int, r: int) -> int:
     if x <= 0:
         return 0
     return b + (x * r + M - 1) // M
+
+
+def _edge5(spec):
+    """容忍 5 元组（delta 缺省 0）与 6 元组。"""
+    if len(spec) == 6:
+        return spec
+    u, v, bal, b, r = spec
+    return u, v, bal, b, r, 0
 
 
 def min_sent(d: int, b: int, r: int):
@@ -51,7 +62,8 @@ def min_sent(d: int, b: int, r: int):
 
 def all_simple_paths(edges, n: int, s: int, t: int):
     adj = [[] for _ in range(n)]
-    for u, v, *_ in edges:
+    for spec in edges:
+        u, v = spec[0], spec[1]
         adj[u].append(v)
     out = []
 
@@ -69,24 +81,39 @@ def all_simple_paths(edges, n: int, s: int, t: int):
 
 
 def edge_lookup(edges):
-    return {(u, v): (bal, b, r) for u, v, bal, b, r in edges}
+    """返回 {(u,v): (bal, b, r, lock_delta)}。"""
+    return {
+        (u, v): (bal, b, r, dl) for (u, v, bal, b, r, dl) in map(_edge5, edges)
+    }
 
 
 def path_table(edges, n: int, path, d_max: int):
-    """返回 {d: (source_paid, [(u,v,delivered,sent),...])}，不可行 d 缺席。"""
+    """返回 {d: (source_paid, [(u,v,delivered,sent,lock),...])}，不可行 d 缺席。
+
+    到期独立地从末跳向前反向累计：末跳上游侧到期 = 末边 delta。
+    """
     emap = edge_lookup(edges)
     table = {0: (0, [])}
+    # 先独立算每跳到期（与金额无关）
+    hop_locks = []
+    acc = 0
+    for u, v in zip(reversed(path[:-1]), reversed(path[1:])):
+        acc += emap[(u, v)][3]
+        hop_locks.append(acc)
+    hop_locks.reverse()
     for d in range(1, d_max + 1):
-        hops = []
         amount = d
+        hops = []
         ok = True
-        for u, v in zip(reversed(path[:-1]), reversed(path[1:])):
-            bal, b, r = emap[(u, v)]
+        hop_seq = list(zip(path[:-1], path[1:]))
+        for j in range(len(hop_seq) - 1, -1, -1):
+            u, v = hop_seq[j]
+            bal, b, r, _dl = emap[(u, v)]
             sent = min_sent(amount, b, r)
             if sent is None or sent > bal:
                 ok = False
                 break
-            hops.append((u, v, amount, sent))
+            hops.append((u, v, amount, sent, hop_locks[j]))
             amount = sent
         if not ok:
             break
@@ -95,12 +122,16 @@ def path_table(edges, n: int, path, d_max: int):
     return table
 
 
-def reference_solve(edges, n: int, s: int, t: int, D: int, max_paths: int = 3):
+def reference_solve(
+    edges, n: int, s: int, t: int, D: int, max_paths: int = 3, max_lock=None
+):
     """返回 (status, payload)。
 
     可行: ("ok", {"cost","paths","allocs","tables"})；
-    不可行: ("infeasible", max_deliverable)；无路: ("unreachable", None)。
+    不可行: ("infeasible", max_deliverable)；无路: ("unreachable", None)；
+    期限超限: ("deadline", min_source_lock)。
     """
+    edges = [_edge5(e) for e in edges]
     paths = all_simple_paths(edges, n, s, t)
     if not paths:
         return "unreachable", None
@@ -111,13 +142,23 @@ def reference_solve(edges, n: int, s: int, t: int, D: int, max_paths: int = 3):
         return "infeasible", 0
     emap = edge_lookup(edges)
 
+    # 独立期限过滤：源端到期 = 路径各边 delta 之和
+    def source_lock_of(path):
+        return sum(emap[(u, v)][3] for u, v in zip(path[:-1], path[1:]))
+
+    if max_lock is not None:
+        locked = [(p, tb) for (p, tb) in live if source_lock_of(p) <= max_lock]
+        if not locked:
+            return "deadline", min(source_lock_of(p) for p, _ in live)
+        live = locked
+
     best_key = None
     best_payload = None
 
     def shared_ok(chosen, allocs):
         use = {}
         for (p, tb), d in zip(chosen, allocs):
-            for u, v, _delivered, sent in tb[d][1]:
+            for u, v, _delivered, sent, _lock in tb[d][1]:
                 use[(u, v)] = use.get((u, v), 0) + sent
         for (u, v), total in use.items():
             if total > emap[(u, v)][0]:

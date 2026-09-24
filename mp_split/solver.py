@@ -10,6 +10,19 @@
 同一组合、同一源支付的不同分拆取分拆向量 (d0,...,d{k-1}) 的
 字典序最大者（确定性取舍，见 README“设计取舍”）。
 
+锁定增量（期限）模型：
+
+* 每条边有非负整数 ``lock_delta``（类 CLTV 增量），与转发金额无关；
+* 以收款端到期 0 为基准，上游在每跳的到期 = 下游到期 + 该边增量，
+  即到期沿路径**从收款端向源端反向累计**；
+* 路径源端到期 ``source_lock`` = 路径各边增量之和，逐跳到期在账单
+  ``HopBill.lock`` 中返回；
+* ``solve(..., max_lock=L)`` 只接受 ``source_lock <= L`` 的路径
+  （等号允许，只有严格超过才过滤）；全部路径都超过时返回
+  ``bottleneck.kind == "deadline_exceeded"``，并在 ``detail`` 中
+  给出最小可达到期。期限是路径级常量，不随分拆金额变化，因此过滤
+  在分拆搜索之前完成，搜索本身与期限无关。
+
 实现要点（k <= 3）：
 
 * 每条路径的费用/账单表对 d=0..cap 预计算；
@@ -48,20 +61,22 @@ class _PathInfo:
     """一条简单路径的预计算信息。
 
     ``table[d] = (source_paid, hops)``，hops 为
-    ``[(edge_index, delivered, sent), ...]``，按转发顺序排列。
+    ``[(edge_index, delivered, sent, lock), ...]``，按转发顺序排列；
+    ``lock`` 为该跳上游侧到期（末跳基准 0 反向累计）。
     """
 
-    __slots__ = ("nodes", "edge_idxs", "cap", "table", "sent_map")
+    __slots__ = ("nodes", "edge_idxs", "cap", "table", "sent_map", "source_lock")
 
-    def __init__(self, nodes, edge_idxs, cap, table) -> None:
+    def __init__(self, nodes, edge_idxs, cap, table, source_lock) -> None:
         self.nodes = nodes
         self.edge_idxs = edge_idxs
         self.cap = cap
         self.table = table
+        self.source_lock = source_lock
         # edge -> {d: 该路径交付 d 时在该边上的实发额}
         self.sent_map: dict[int, dict[int, int]] = {}
         for d, (_, hops) in enumerate(table):
-            for ei, _, sent in hops:
+            for ei, _, sent, _lock in hops:
                 self.sent_map.setdefault(ei, {})[d] = sent
 
     def sent_on(self, ei: int, d: int) -> int:
@@ -426,13 +441,24 @@ def _build_path_info(
 ) -> _PathInfo | None:
     """计算路径在 d=0..d_max 下的反向递推账单与可用容量。
 
+    到期同样从收款端向源端反向累计：末跳上游侧到期 = 末边增量，
+    逐跳向前累加；``source_lock`` 为路径全部边的增量之和，与 d 无关。
+
     若路径上存在 ``ppm >= 1e6`` 的边，任何正金额都不可交付（cap=0，
     该路径被丢弃）。
     """
-    table: list[tuple[int, list[tuple[int, int, int]]]] = [(0, [])]
+    # 期限与金额无关，先一次性反向累计：locks[j] 为第 j 跳上游侧到期。
+    locks = [0] * len(edge_idxs)
+    acc = 0
+    for j in range(len(edge_idxs) - 1, -1, -1):
+        acc += net.edges[edge_idxs[j]].lock_delta
+        locks[j] = acc
+    source_lock = acc
+
+    table: list[tuple[int, list[tuple[int, int, int, int]]]] = [(0, [])]
     cap = 0
     for d in range(1, d_max + 1):
-        hops: list[tuple[int, int, int]] = [None] * len(edge_idxs)  # type: ignore[list-item]
+        hops: list[tuple[int, int, int, int]] = [None] * len(edge_idxs)  # type: ignore[list-item]
         amount = d
         ok = True
         for j in range(len(edge_idxs) - 1, -1, -1):
@@ -442,14 +468,14 @@ def _build_path_info(
             if sent is None or sent > e.balance:
                 ok = False
                 break
-            hops[j] = (ei, amount, sent)
+            hops[j] = (ei, amount, sent, locks[j])
             amount = sent
         if not ok:
             # 费用与所需实发额对 d 单调：更大的 d 同样不可行
             break
         table.append((amount, hops))
         cap = d
-    return _PathInfo(nodes, edge_idxs, cap, table)
+    return _PathInfo(nodes, edge_idxs, cap, table, source_lock)
 
 
 def solve(
@@ -460,6 +486,7 @@ def solve(
     *,
     max_paths: int = MAX_PATHS,
     budget: int = DEFAULT_BUDGET,
+    max_lock: int | None = None,
 ) -> SplitResult:
     """求最优多路径分拆。
 
@@ -470,6 +497,12 @@ def solve(
         max_paths: 允许使用的最多简单路径数（1..3）。
         budget: 搜索评估上限；耗尽时抛 :class:`SearchBudgetExhausted`
             （“算不动”，不是无解结论）。
+        max_lock: 付款人最大期限（非负整数），``None``（默认）表示
+            不限制。给定后只接受**源端累计到期** ``source_lock <=
+            max_lock`` 的路径；累计到期以收款端到期 0 为基准，沿路径
+            各边 ``lock_delta`` 反向累加。等号允许（恰好等于不超限），
+            严格超过才过滤。所有可交付路径都超限时返回
+            ``bottleneck.kind == "deadline_exceeded"``。
 
     返回:
         :class:`SplitResult`。无可行解时 ``feasible=False`` 且带
@@ -496,6 +529,12 @@ def solve(
     bg = _is_real_int(budget, "budget")
     if bg <= 0:
         raise NetworkValidationError(f"budget: must be > 0, got {budget}")
+    if max_lock is not None:
+        L = _is_real_int(max_lock, "max_lock")
+        if L < 0:
+            raise NetworkValidationError(f"max_lock: must be >= 0, got {L}")
+    else:
+        L = None
 
     counter = {"n": 0}
 
@@ -506,7 +545,7 @@ def solve(
 
     # D=0：平凡可行，不使用任何路径
     if D == 0:
-        return SplitResult(True, 0, 0, (), (), None, 0, 0)
+        return SplitResult(True, 0, 0, (), (), None, 0, 0, L)
 
     adj = network.adjacency()
     raw_paths = _enumerate_simple_paths(adj, s, t)
@@ -520,15 +559,16 @@ def solve(
             Bottleneck("unreachable", f"no simple path from {source} to {destination}"),
             D,
             0,
+            L,
         )
 
-    infos: list[_PathInfo] = []
+    all_infos: list[_PathInfo] = []
     for nodes, edge_idxs in raw_paths:
         info = _build_path_info(network, nodes, edge_idxs, D)
         if info is not None and info.cap >= 1:
-            infos.append(info)
+            all_infos.append(info)
 
-    if not infos:
+    if not all_infos:
         return SplitResult(
             False,
             None,
@@ -544,7 +584,37 @@ def solve(
             ),
             D,
             0,
+            L,
         )
+
+    # 期限过滤：累计到期是路径级常量（与分拆金额无关），在分拆搜索前
+    # 一次性剔除 source_lock > max_lock 的路径。等号保留。
+    if L is not None:
+        infos = [p for p in all_infos if p.source_lock <= L]
+        if not infos:
+            min_lock = min(p.source_lock for p in all_infos)
+            lexi = min(all_infos, key=lambda p: (p.source_lock, p.nodes)).nodes
+            lex_path = " -> ".join(str(network.to_label(v)) for v in lexi)
+            return SplitResult(
+                False,
+                None,
+                0,
+                (),
+                (),
+                Bottleneck(
+                    "deadline_exceeded",
+                    f"every deliverable {source}->{destination} path exceeds the "
+                    f"payer max_lock {L}: minimum achievable source lock is "
+                    f"{min_lock} (earliest path {lex_path}); locks accumulate "
+                    f"from the receiver backward as the sum of per-edge "
+                    f"lock_delta values",
+                ),
+                D,
+                0,
+                L,
+            )
+    else:
+        infos = all_infos
 
     pair_tables: dict[tuple[int, int], _PairTables] = {}
     diag_cache: dict[tuple[int, ...], int] = {}
@@ -573,9 +643,11 @@ def solve(
             best_cost,  # type: ignore[arg-type]
             D,
             counter["n"],
+            L,
         )
 
     # ---- 已证明无解：诊断 <=D 的最大可交付额 ----
+    # 只在通过期限过滤的 infos 上搜索：超限路径本来就不可选。
     best_achievable = 0
     for k in range(1, mp + 1):
         for combo in combinations(infos, k):
@@ -590,6 +662,11 @@ def solve(
         f"paths; edge balances are charged on the actual sent amount "
         f"(delivered + fee b + ceil(x*r/1e6))"
     )
+    if L is not None:
+        detail += (
+            f"; only paths with source lock <= max_lock {L} are eligible "
+            f"(locks accumulate per-edge lock_delta backward from the receiver)"
+        )
     return SplitResult(
         False,
         None,
@@ -599,6 +676,7 @@ def solve(
         Bottleneck("insufficient_balance", detail),
         D,
         counter["n"],
+        L,
     )
 
 
@@ -609,6 +687,7 @@ def _build_result(
     source_total: int,
     D: int,
     evaluations: int,
+    max_lock: int | None,
 ) -> SplitResult:
     path_bills: list[PathBill] = []
     # edge index -> [delivered, fee, sent, path positions]
@@ -618,7 +697,7 @@ def _build_result(
     for pos, (p, d) in enumerate(zip(combo, alloc)):
         _, hops = p.table[d]
         hop_bills: list[HopBill] = []
-        for ei, delivered, sent in hops:
+        for ei, delivered, sent, lock in hops:
             ie = net.edges[ei]
             out_edge = Edge(
                 net.to_label(ie.src),
@@ -626,9 +705,10 @@ def _build_result(
                 ie.balance,
                 ie.base_fee,
                 ie.ppm,
+                ie.lock_delta,
             )
             fee = sent - delivered
-            hop_bills.append(HopBill(out_edge, delivered, fee, sent))
+            hop_bills.append(HopBill(out_edge, delivered, fee, sent, lock))
             row = agg.setdefault(ei, [0, 0, 0, []])
             row[0] += delivered
             row[1] += fee
@@ -637,14 +717,26 @@ def _build_result(
         paid, _ = p.table[d]
         assert hop_bills[0].sent == paid
         assert hop_bills[-1].delivered == d
+        # 首跳到期即源端累计到期；末跳到期等于末边增量（基准 0）
+        assert hop_bills[0].lock == p.source_lock
+        assert hop_bills[-1].lock == hop_bills[-1].edge.lock_delta
+        # 相邻跳到期差恰为前一跳边的增量
+        for hj, hn in zip(hop_bills, hop_bills[1:]):
+            assert hj.lock - hn.lock == hj.edge.lock_delta
         delivered_check += d
         path_bills.append(
             PathBill(
-                tuple(net.to_label(v) for v in p.nodes), d, paid, tuple(hop_bills)
+                tuple(net.to_label(v) for v in p.nodes),
+                d,
+                paid,
+                tuple(hop_bills),
+                p.source_lock,
             )
         )
 
     assert delivered_check == D
+    if max_lock is not None:
+        assert all(pb.source_lock <= max_lock for pb in path_bills)
     usages: list[EdgeUsage] = []
     for ei in sorted(agg):
         delivered, fee, sent, positions = agg[ei]
@@ -656,6 +748,7 @@ def _build_result(
             ie.balance,
             ie.base_fee,
             ie.ppm,
+            ie.lock_delta,
         )
         usages.append(EdgeUsage(out_edge, delivered, fee, sent, tuple(positions)))
 
@@ -669,4 +762,5 @@ def _build_result(
         None,
         D,
         evaluations,
+        max_lock,
     )

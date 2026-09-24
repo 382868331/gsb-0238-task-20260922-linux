@@ -5,13 +5,17 @@
 
 数据结构（均为不可变值对象）::
 
-    Edge(src, dst, balance, base_fee=b, ppm=r)
+    Edge(src, dst, balance, base_fee=b, ppm=r, lock_delta=dl)
     Network(edges, node_count=None)
-    HopBill(edge, delivered, fee, sent)
-    PathBill(path, delivered, source_paid, hops)
+    HopBill(edge, delivered, fee, sent, lock)
+    PathBill(path, delivered, source_paid, hops, source_lock)
     EdgeUsage(edge, delivered_total, fee_total, sent_total, paths)
     Bottleneck(kind, detail)
     SplitResult(feasible, ...)
+
+锁定增量 ``lock_delta`` 是纯整数的期限模型（类 CLTV 增量）：每经过
+一条边，上游为该跳设置的到期必须比下游至少多出该边的增量；到期沿
+路径**从收款端向源端反向累计**。详见 ``solver.solve`` 的 ``max_lock``。
 """
 
 from __future__ import annotations
@@ -55,6 +59,8 @@ class Edge:
             ``sent = delivered + fee``，非负整数。
         base_fee: 固定费 b，非负整数。
         ppm: 比例费 r，单位 ppm（fee 比例项 = ceil(x*r/1e6)），非负整数。
+        lock_delta: 锁定增量 dl（类 CLTV 时间锁增量），非负整数。
+            上游在该跳要求的到期 = 下游到期 + dl；与转发金额无关。
     """
 
     src: int
@@ -62,6 +68,7 @@ class Edge:
     balance: int
     base_fee: int = 0
     ppm: int = 0
+    lock_delta: int = 0
 
     def __post_init__(self) -> None:
         where = f"edge ({self.src!r}->{self.dst!r})"
@@ -70,6 +77,7 @@ class Edge:
         balance = _is_real_int(self.balance, f"{where}.balance")
         base_fee = _is_real_int(self.base_fee, f"{where}.base_fee")
         ppm = _is_real_int(self.ppm, f"{where}.ppm")
+        lock_delta = _is_real_int(self.lock_delta, f"{where}.lock_delta")
         if src < 0:
             raise NetworkValidationError(f"{where}.src: must be >= 0, got {src}")
         if dst < 0:
@@ -82,6 +90,10 @@ class Edge:
             raise NetworkValidationError(f"{where}.base_fee: must be >= 0, got {base_fee}")
         if ppm < 0:
             raise NetworkValidationError(f"{where}.ppm: must be >= 0, got {ppm}")
+        if lock_delta < 0:
+            raise NetworkValidationError(
+                f"{where}.lock_delta: must be >= 0, got {lock_delta}"
+            )
 
 
 @dataclass(frozen=True)
@@ -142,7 +154,9 @@ class Network:
                     f"edges[{i}]: duplicate directed edge {e.src}->{e.dst}"
                 )
             seen_pairs.add(pair)
-            norm_edges.append(Edge(pair[0], pair[1], e.balance, e.base_fee, e.ppm))
+            norm_edges.append(
+                Edge(pair[0], pair[1], e.balance, e.base_fee, e.ppm, e.lock_delta)
+            )
 
         object.__setattr__(self, "edges", tuple(norm_edges))
         object.__setattr__(self, "node_count", len(labels))
@@ -173,12 +187,18 @@ class Network:
 
 @dataclass(frozen=True)
 class HopBill:
-    """一跳账单：在某条边上转发 ``delivered``，收费 ``fee``，上游实付 ``sent``。"""
+    """一跳账单：在某条边上转发 ``delivered``，收费 ``fee``，上游实付 ``sent``。
+
+    ``lock`` 是**本跳上游侧**（付款方向）该笔转发的到期时刻（绝对
+    时间锁高度，整数）：它等于下游跳到期加本边 ``lock_delta``；
+    末跳的到期取 0 基准（见 ``solver.solve`` 的 ``max_lock``）。
+    """
 
     edge: Edge
     delivered: int
     fee: int
     sent: int
+    lock: int
 
 
 @dataclass(frozen=True)
@@ -188,12 +208,17 @@ class PathBill:
     ``path`` 使用原始节点编号；``hops`` 从收款端向源端反向递推得到，
     但按转发顺序（源 -> 收款端）排列，``hops[0].delivered`` 是源在
     第一跳实付，``hops[-1].delivered == D_path``。
+
+    ``source_lock`` 是源在第一跳承担的到期（路径各边 ``lock_delta``
+    之和，以收款端 0 为基准）；``hops[j].lock`` 为该跳上游侧到期，
+    相邻跳满足 ``hops[j].lock - hops[j+1].lock == hops[j].edge.lock_delta``。
     """
 
     path: tuple[int, ...]
     delivered: int
     source_paid: int
     hops: tuple[HopBill, ...]
+    source_lock: int
 
 
 @dataclass(frozen=True)
@@ -215,6 +240,8 @@ class Bottleneck:
         ``"unreachable"``        —— 源到收款端不存在任何简单路径
         ``"insufficient_balance"`` —— 存在路径，但余额（按实际发送额
             计）不足以交付 D；``detail`` 给出收紧后的最小边容量说明
+        ``"deadline_exceeded"``  —— 所有路径的源端累计到期都超过
+            付款人最大期限 ``max_lock``；``detail`` 给出最小可达到期
     """
 
     kind: str
@@ -229,6 +256,7 @@ class SplitResult:
     ``used_paths``、``source_total``、``edge_usages``。
     不可行时：``feasible=False``，含 ``bottleneck``。
     ``evaluations`` 为搜索中评估的路径集合数（可观测性，非优化目标）。
+    ``max_lock`` 回显本次求解的付款人最大期限（``None`` 表示不限制）。
     """
 
     feasible: bool
@@ -239,3 +267,4 @@ class SplitResult:
     bottleneck: Bottleneck | None
     delivery: int
     evaluations: int
+    max_lock: int | None = None

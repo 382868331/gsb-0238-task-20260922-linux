@@ -139,7 +139,8 @@ class CrossValidateTests(unittest.TestCase):
                     mismatches.append((idx, "path source_paid mismatch", pb))
                     break
                 got_hops = [
-                    (h.edge.src, h.edge.dst, h.delivered, h.sent) for h in pb.hops
+                    (h.edge.src, h.edge.dst, h.delivered, h.sent, h.lock)
+                    for h in pb.hops
                 ]
                 if got_hops != exp_hops:
                     mismatches.append((idx, f"hops {got_hops} vs {exp_hops}", None))
@@ -178,6 +179,160 @@ class CrossValidateTests(unittest.TestCase):
         status, payload = reference_solve(edges, 4, 0, 3, 10, max_paths=1)
         self.assertEqual(status, "infeasible")
         self.assertIn(f"at most {payload} of 10", r.bottleneck.detail)
+
+
+def make_lock_cases():
+    """确定性生成带 lock_delta 与 max_lock 的 (edges,n,s,t,D,max_lock)。"""
+    rng = random.Random(20260924)
+    cases = []
+    # 手工：便宜长锁 vs 贵短锁
+    cases.append(
+        (
+            [
+                (0, 1, 100, 0, 0, 25), (1, 3, 100, 0, 0, 25),
+                (0, 2, 100, 5, 0, 10), (2, 3, 100, 0, 0, 10),
+            ],
+            4, 0, 3, 10, 20,
+        )
+    )
+    for seed in range(300):
+        n = rng.choice([3, 4, 4, 5])
+        all_edges = [(u, v) for u in range(n) for v in range(n) if u != v]
+        m = rng.randint(n - 1, min(len(all_edges), 9))
+        pairs = rng.sample(all_edges, m)
+        edges = []
+        for u, v in pairs:
+            bal = rng.choice([0, 1, 2, 4, 8, 12, 50])
+            b = rng.choice([0, 0, 0, 1, 2, 5])
+            r = rng.choice([0, 0, 1, 100, 1000, 500_000, 999_999])
+            dl = rng.choice([0, 0, 0, 1, 5, 10, 20, 40])
+            edges.append((u, v, bal, b, r, dl))
+        s, t = rng.sample(range(n), 2)
+        D = rng.randint(1, 12)
+        max_lock = rng.choice([None, None, 0, 5, 10, 20, 60])
+        cases.append((edges, n, s, t, D, max_lock))
+    return cases
+
+
+LOCK_CASES = make_lock_cases()
+
+
+class CrossValidateLocksTests(unittest.TestCase):
+    def test_against_independent_reference_with_locks(self):
+        mismatches = []
+        for idx, (edges, n, s, t, D, ml) in enumerate(LOCK_CASES):
+            network = Network([Edge(*e) for e in edges], node_count=n)
+            result = solve(network, s, t, D, max_lock=ml)
+            status, payload = reference_solve(
+                edges, n, s, t, D, max_lock=ml
+            )
+
+            if status == "unreachable":
+                if result.feasible or result.bottleneck.kind != "unreachable":
+                    mismatches.append((idx, "expected unreachable", result))
+                continue
+
+            if status == "deadline":
+                if result.feasible:
+                    mismatches.append((idx, "expected deadline_exceeded", result))
+                    continue
+                if result.bottleneck.kind != "deadline_exceeded":
+                    mismatches.append(
+                        (idx, f"got {result.bottleneck.kind}, want deadline", None)
+                    )
+                    continue
+                # detail 中必须含最小可达到期
+                if f"lock is {payload}" not in result.bottleneck.detail:
+                    mismatches.append(
+                        (idx, f"min lock {payload} vs {result.bottleneck.detail}", None)
+                    )
+                continue
+
+            if status == "infeasible":
+                if result.feasible:
+                    mismatches.append((idx, "expected infeasible", result))
+                    continue
+                if result.bottleneck.kind != "insufficient_balance":
+                    mismatches.append((idx, "wrong bottleneck kind", result.bottleneck))
+                    continue
+                if f"at most {payload} of {D}" not in result.bottleneck.detail:
+                    mismatches.append(
+                        (idx, f"achievable {payload} vs {result.bottleneck.detail}", None)
+                    )
+                continue
+
+            # feasible
+            if not result.feasible:
+                mismatches.append((idx, "expected feasible", result.bottleneck))
+                continue
+            if result.source_total != payload["cost"]:
+                mismatches.append(
+                    (idx, f"cost {result.source_total} vs {payload['cost']}", None)
+                )
+                continue
+            got_paths = [pb.path for pb in result.paths]
+            if got_paths != [tuple(p) for p in payload["paths"]]:
+                mismatches.append((idx, "paths differ", None))
+                continue
+            got_alloc = [pb.delivered for pb in result.paths]
+            if got_alloc != payload["allocs"]:
+                mismatches.append((idx, "alloc differs", None))
+                continue
+
+            # 逐跳（含到期）与参考的独立反向累计完全一致
+            for pb, table, d in zip(result.paths, payload["tables"], got_alloc):
+                exp_paid, exp_hops = table[d]
+                if pb.source_paid != exp_paid:
+                    mismatches.append((idx, "path source_paid mismatch", pb))
+                    break
+                got_hops = [
+                    (h.edge.src, h.edge.dst, h.delivered, h.sent, h.lock)
+                    for h in pb.hops
+                ]
+                if got_hops != exp_hops:
+                    mismatches.append(
+                        (idx, f"hops {got_hops} vs {exp_hops}", None)
+                    )
+                    break
+                # source_lock 与首跳到期、路径增量之和一致
+                emap = {
+                    (u, v): dl for (u, v, _b1, _b2, _r, dl) in edges
+                }
+                exp_lock = sum(
+                    emap[(u, v)] for u, v in zip(pb.path[:-1], pb.path[1:])
+                )
+                if pb.source_lock != exp_lock or pb.hops[0].lock != exp_lock:
+                    mismatches.append((idx, "source_lock mismatch", pb))
+                    break
+                if ml is not None and pb.source_lock > ml:
+                    mismatches.append((idx, "source_lock exceeds max_lock", pb))
+                    break
+
+        if mismatches:
+            preview = "\n".join(str(m[:2]) for m in mismatches[:10])
+            self.fail(f"{len(mismatches)} mismatches, first:\n{preview}")
+
+    def test_deadline_filter_is_additive(self):
+        # 解析关系：收紧 max_lock 只会（非严格）减少可行路径集合，
+        # 因此同一问题随 max_lock 减小，结论只能按
+        # feasible -> insufficient_balance/deadline_exceeded 单调退化。
+        edges = [
+            (0, 1, 6, 0, 0, 5), (1, 3, 6, 0, 0, 5),
+            (0, 2, 6, 0, 0, 30), (2, 3, 6, 0, 0, 30),
+        ]
+        network = Network([Edge(*e) for e in edges], node_count=4)
+        kinds = []
+        for ml in [60, 30, 10, 9, 0]:
+            r = solve(network, 0, 3, 10, max_lock=ml)
+            kinds.append("ok" if r.feasible else r.bottleneck.kind)
+        # A 锁 10 / cap 6，B 锁 60 / cap 6：
+        # 60 两条都可用（拆 6+4 可行）；30、10 只余 A（cap 6，余额不足）；
+        # 9、0 无任何路径满足期限（deadline_exceeded）。
+        self.assertEqual(
+            kinds,
+            ["ok", "insufficient_balance", "insufficient_balance",
+             "deadline_exceeded", "deadline_exceeded"],
+        )
 
 
 if __name__ == "__main__":
