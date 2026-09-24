@@ -6,7 +6,13 @@
 1. 正常案例：6 节点网络，三条候选路径在末跳 4->5 汇合（共享边），
    求 D=60 的最低源支付分拆，逐跳打印账单并核对每边余额；
 2. 同网络 D=100：打印“已证明无解”的不可行瓶颈（可交付上界）；
-3. 边界拒绝：构造余额为 NaN 的边，展示可定位的输入校验异常。
+3. 边界拒绝：构造余额为 NaN 的边，展示可定位的输入校验异常；
+4. 锁定增量与到期（本次迭代）：
+   4a. 正常结果——max_lock 过滤掉免费但长锁的路径，逐跳打印
+       反向累计到期；
+   4b. 期限等号边界——lock_total == max_lock 合法（放行），
+       再小 1 则全部被过滤，返回 lock_limit_exceeded；
+   4c. 非法参数——max_lock=-1 在任何计算前被拒绝。
 """
 
 from mp_split import Edge, Network, solve
@@ -29,6 +35,37 @@ def build_network() -> Network:
         Edge(4, 5, balance=100, base_fee=1, ppm=1_000),
     ]
     return Network(edges, node_count=6)
+
+
+def build_lock_network() -> Network:
+    # 两条 0->5 的三跳路径（节点 0..5）：
+    #   A: 0->1->2->5，零费，各边锁定增量 2,3,4 -> 总锁定期 9
+    #   B: 0->3->4->5，首跳固定费 4，增量 1,1,1 -> 总锁定期 3
+    edges = [
+        Edge(0, 1, balance=100, base_fee=0, ppm=0, lock_delta=2),
+        Edge(1, 2, balance=100, base_fee=0, ppm=0, lock_delta=3),
+        Edge(2, 5, balance=100, base_fee=0, ppm=0, lock_delta=4),
+        Edge(0, 3, balance=100, base_fee=4, ppm=0, lock_delta=1),
+        Edge(3, 4, balance=100, base_fee=0, ppm=0, lock_delta=1),
+        Edge(4, 5, balance=100, base_fee=0, ppm=0, lock_delta=1),
+    ]
+    return Network(edges, node_count=6)
+
+
+def print_path_bills(r) -> None:
+    for i, pb in enumerate(r.paths):
+        print(f"\n路径 {i + 1}: {' -> '.join(map(str, pb.path))}"
+              f"  交付 {pb.delivered}，源付 {pb.source_paid}"
+              f"，总锁定期 {pb.lock_total}")
+        print("  逐跳账单（转发顺序；到期为该跳至末跳的反向累计）：")
+        for h in pb.hops:
+            print(
+                f"    {h.edge.src}->{h.edge.dst}: "
+                f"转发 {h.sent:>3} = 交付下游 {h.delivered:>3} + 费用 {h.fee:>2}"
+                f"  到期 {h.expiry:>2}"
+                f"  (b={h.edge.base_fee}, ppm={h.edge.ppm},"
+                f" 增量={h.edge.lock_delta}, 余额={h.edge.balance})"
+            )
 
 
 def main() -> None:
@@ -92,6 +129,51 @@ def main() -> None:
         print("捕获 NetworkValidationError：")
         print(f"  {exc}")
         print("非法输入被拒绝，未产生任何部分结果。")
+
+    print()
+    print("=" * 72)
+    print("案例 4a（正常·期限过滤）：免费长锁路径 vs 收费短锁路径，D = 10")
+    print("=" * 72)
+    lnet = build_lock_network()
+    r_free = solve(lnet, 0, 5, 10)
+    assert r_free.feasible
+    print("不设 max_lock：选免费路径 A，源付", r_free.source_total,
+          "，总锁定期", r_free.paths[0].lock_total)
+    print_path_bills(r_free)
+    r_lim = solve(lnet, 0, 5, 10, max_lock=8)
+    assert r_lim.feasible
+    print("\nmax_lock=8：路径 A 总锁定期 9 > 8 被逐路径过滤，改走短锁路径 B：")
+    print_path_bills(r_lim)
+    assert r_lim.source_total == 14
+    assert r_lim.paths[0].lock_total == 3
+    assert [h.expiry for h in r_lim.paths[0].hops] == [3, 2, 1]
+    print("\n手算核对：首跳固定费 4 -> 源付 14；到期反向累计 [1+1+1, 1+1, 1]"
+          " = [3, 2, 1]；源付合计 14。")
+
+    print()
+    print("=" * 72)
+    print("案例 4b（期限等号边界）：max_lock = 3 放行，= 2 全部过滤")
+    print("=" * 72)
+    r_eq = solve(lnet, 0, 5, 10, max_lock=3)
+    assert r_eq.feasible
+    print(f"max_lock=3（== B 的总锁定期，等号允许）：可行，走 "
+          f"{' -> '.join(map(str, r_eq.paths[0].path))}")
+    r_too_tight = solve(lnet, 0, 5, 10, max_lock=2)
+    assert not r_too_tight.feasible
+    print("max_lock=2：A(9)、B(3) 均超过期限——")
+    print(f"  瓶颈类型：{r_too_tight.bottleneck.kind}")
+    print(f"  说明：{r_too_tight.bottleneck.detail}")
+
+    print()
+    print("=" * 72)
+    print("案例 4c（非法参数）：max_lock = -1")
+    print("=" * 72)
+    try:
+        solve(lnet, 0, 5, 10, max_lock=-1)
+    except NetworkValidationError as exc:
+        print("捕获 NetworkValidationError：")
+        print(f"  {exc}")
+        print("非法输入在任何计算前被拒绝，求解无状态、无部分变更。")
 
 
 if __name__ == "__main__":

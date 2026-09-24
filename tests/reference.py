@@ -8,8 +8,10 @@
 * 穷举 1..3 条路径的全部组合与全部正整数分拆；
 * 目标键 (源支付, 路径数, 路径节点元组, 分拆向量取负) 取字典序最小。
 
-图输入用裸元组 ``(src, dst, balance, base_fee, ppm)``，节点编号必须
-为连续的 ``0..n-1``（测试网络都满足），避免任何被测代码参与期望值。
+图输入用裸元组 ``(src, dst, balance, base_fee, ppm)`` 或带锁定增量的
+``(src, dst, balance, base_fee, ppm, lock_delta)``（缺省为 0），节点
+编号必须为连续的 ``0..n-1``（测试网络都满足），避免任何被测代码参与
+期望值。
 """
 
 from __future__ import annotations
@@ -69,19 +71,28 @@ def all_simple_paths(edges, n: int, s: int, t: int):
 
 
 def edge_lookup(edges):
-    return {(u, v): (bal, b, r) for u, v, bal, b, r in edges}
+    out = {}
+    for e in edges:
+        u, v, bal, b, r = e[:5]
+        dl = e[5] if len(e) >= 6 else 0
+        out[(u, v)] = (bal, b, r, dl)
+    return out
 
 
 def path_table(edges, n: int, path, d_max: int):
-    """返回 {d: (source_paid, [(u,v,delivered,sent),...])}，不可行 d 缺席。"""
+    """返回 {d: (source_paid, [(u,v,delivered,sent),...])}，不可行 d 缺席。
+
+    另外返回该路径的总锁定期（各边 lock_delta 之和），与 d 无关。
+    """
     emap = edge_lookup(edges)
+    lock_total = sum(emap[(u, v)][3] for u, v in zip(path[:-1], path[1:]))
     table = {0: (0, [])}
     for d in range(1, d_max + 1):
         hops = []
         amount = d
         ok = True
         for u, v in zip(reversed(path[:-1]), reversed(path[1:])):
-            bal, b, r = emap[(u, v)]
+            bal, b, r, _dl = emap[(u, v)]
             sent = min_sent(amount, b, r)
             if sent is None or sent > bal:
                 ok = False
@@ -92,31 +103,58 @@ def path_table(edges, n: int, path, d_max: int):
             break
         hops.reverse()
         table[d] = (amount, hops)
-    return table
+    return table, lock_total
 
 
-def reference_solve(edges, n: int, s: int, t: int, D: int, max_paths: int = 3):
+def hop_expiries(emap, path):
+    """独立直算逐跳到期：expiry_j = 本边及其后各边 delta 之和。"""
+    acc = 0
+    out = [0] * (len(path) - 1)
+    for j in range(len(path) - 2, -1, -1):
+        u, v = path[j], path[j + 1]
+        acc += emap[(u, v)][3]
+        out[j] = acc
+    return out
+
+
+def reference_solve(
+    edges, n: int, s: int, t: int, D: int, max_paths: int = 3, max_lock=None
+):
     """返回 (status, payload)。
 
-    可行: ("ok", {"cost","paths","allocs","tables"})；
-    不可行: ("infeasible", max_deliverable)；无路: ("unreachable", None)。
+    可行: ("ok", {"cost","paths","allocs","tables","locks"})；
+    不可行: ("infeasible", max_deliverable)；无路: ("unreachable", None)；
+    期限过滤光: ("lock_exceeded", min_lock_total)。
     """
     paths = all_simple_paths(edges, n, s, t)
     if not paths:
         return "unreachable", None
-    tables = [path_table(edges, n, p, D) for p in paths]
+    built = [path_table(edges, n, p, D) for p in paths]
+    tables = [tb for tb, _lt in built]
+    lock_totals = [lt for _tb, lt in built]
     # 仅保留正容量路径
-    live = [(p, tb) for p, tb in zip(paths, tables) if max(tb) >= 1]
+    live = [
+        (p, tb, lt)
+        for p, tb, lt in zip(paths, tables, lock_totals)
+        if max(tb) >= 1
+    ]
     if not live:
         return "infeasible", 0
     emap = edge_lookup(edges)
+
+    # 期限硬过滤（逐路径，等号允许）
+    if max_lock is not None:
+        allowed = [(p, tb, lt) for p, tb, lt in live if lt <= max_lock]
+        if not allowed:
+            return "lock_exceeded", min(lt for _p, _tb, lt in live)
+        live = allowed
 
     best_key = None
     best_payload = None
 
     def shared_ok(chosen, allocs):
         use = {}
-        for (p, tb), d in zip(chosen, allocs):
+        for (p, tb, lt), d in zip(chosen, allocs):
             for u, v, _delivered, sent in tb[d][1]:
                 use[(u, v)] = use.get((u, v), 0) + sent
         for (u, v), total in use.items():
@@ -140,26 +178,27 @@ def reference_solve(edges, n: int, s: int, t: int, D: int, max_paths: int = 3):
     for k in range(1, max_paths + 1):
         for combo in combinations(range(len(live)), k):
             chosen = [live[i] for i in combo]
-            caps = [max(tb) for _, tb in chosen]
+            caps = [max(tb) for _p, tb, _lt in chosen]
             if sum(caps) < D:
                 continue
             for alloc in compositions(k, D, caps):
-                cost = sum(tb[d][0] for (_, tb), d in zip(chosen, alloc))
+                cost = sum(tb[d][0] for (_p, tb, _lt), d in zip(chosen, alloc))
                 if not shared_ok(chosen, alloc):
                     continue
                 key = (
                     cost,
                     k,
-                    tuple(p for p, _ in chosen),
+                    tuple(p for p, _tb, _lt in chosen),
                     tuple(-a for a in alloc),
                 )
                 if best_key is None or key < best_key:
                     best_key = key
                     best_payload = {
                         "cost": cost,
-                        "paths": [p for p, _ in chosen],
+                        "paths": [p for p, _tb, _lt in chosen],
                         "allocs": list(alloc),
-                        "tables": [tb for _, tb in chosen],
+                        "tables": [tb for _p, tb, _lt in chosen],
+                        "locks": [lt for _p, _tb, lt in chosen],
                     }
 
     if best_payload is None:
@@ -170,7 +209,7 @@ def reference_solve(edges, n: int, s: int, t: int, D: int, max_paths: int = 3):
             for k in range(1, max_paths + 1):
                 for combo in combinations(range(len(live)), k):
                     chosen = [live[i] for i in combo]
-                    caps = [max(tb) for _, tb in chosen]
+                    caps = [max(tb) for _p, tb, _lt in chosen]
                     if sum(caps) < target:
                         continue
                     # 允许 0：在至多 k 条路径上的非负分拆
@@ -186,7 +225,7 @@ def reference_solve(edges, n: int, s: int, t: int, D: int, max_paths: int = 3):
                         nz = [(c, a) for c, a in zip(chosen, alloc0) if a > 0]
                         if not nz:
                             continue
-                        if shared_ok([c for c, _ in nz], [a for _, a in nz]):
+                        if shared_ok([c for c, _a in nz], [a for _c, a in nz]):
                             found = True
                             break
                     if found:
