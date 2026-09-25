@@ -35,3 +35,37 @@ class SearchBudgetExhausted(MPSplitError):
             f"search budget exhausted: {used} evaluations >= budget {budget}; "
             "this is NOT a proof of infeasibility"
         )
+
+
+class ReservationError(MPSplitError):
+    """预留账本相关错误的基类。"""
+
+
+class UnknownReservationError(ReservationError):
+    """commit/abort/查询引用了不存在的请求 ID。"""
+
+    def __init__(self, request_id: str) -> None:
+        self.request_id = request_id
+        super().__init__(f"unknown reservation request_id {request_id!r}")
+
+
+class ReservationConflictError(ReservationError):
+    """同一请求 ID 以不同参数重复 prepare（幂等冲突）。"""
+
+    def __init__(self, request_id: str) -> None:
+        self.request_id = request_id
+        super().__init__(
+            f"request_id {request_id!r} was already used with different parameters; "
+            "identical replays return the stored state, divergent ones are rejected"
+        )
+
+
+class ReservationStateError(ReservationError):
+    """非法状态迁移（如对终态记录做反向操作，或 commit 已过期预留）。"""
+
+    def __init__(self, request_id: str, status: str, op: str) -> None:
+        self.request_id = request_id
+        self.status = status
+        super().__init__(
+            f"cannot {op} reservation {request_id!r} in terminal state {status!r}"
+        )

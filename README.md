@@ -153,18 +153,73 @@ result = solve(net, source=0, destination=2, delivery=60,
 执行测试（必要测试，含与独立参考实现的穷举交叉验证）：
 
 ```bash
-python -m unittest discover -s tests -v
+./.venv/bin/python -m unittest discover -s tests -v
 ```
 
 执行演示（真实计算；约 0.04 秒，远低于 8 秒；不使用 sleep 或预录
 结果）：
 
 ```bash
-python demo.py
+./.venv/bin/python demo.py
 ```
 
 演示打印：一个 D=60 的成功分拆（逐跳账单 + 每边余额核对）、一个
 D=100 的已证明无解瓶颈，以及一个 NaN 余额被拒绝的异常边界。
+
+## 预留事务层（prepare / commit / abort）
+
+`mp_split.reservations.ReservationLedger` 在无状态求解器之上提供
+**有限预留事务**：`prepare` 计算路径并按逐边**实际发送额**占住容量
+（不扣最终余额）；`commit` 结算（余额真正减少）；`abort` 或逻辑时钟
+到期释放。这不是预约业务系统，也不连接支付网络。
+
+```python
+from mp_split import Edge, Network, ReservationLedger
+
+ledger = ReservationLedger(Network([Edge(0, 1, 20, 1, 0), Edge(1, 2, 20, 2, 0)],
+                                   node_count=3))
+r = ledger.prepare("pay-1", 0, 2, 10, ttl=5, now=0)   # 占住容量
+ledger.commit("pay-1", now=3)                          # 结算扣余额
+```
+
+### 参数
+
+- `prepare(request_id, source, destination, delivery, *, max_paths=3, ttl, now=0, budget)`：
+  `request_id` 非空字符串，全局唯一；`ttl > 0` 为逻辑时钟有效期，
+  `expires_at = now + ttl`；`now >= 0` 为调用方给的逻辑时钟（整数，
+  拒绝 bool/float）；其余参数契约与 `solve` 相同。新规划看到
+  **余额减去全部有效预留后的可用量**，共享边仍按每跳实际发送额计。
+- `commit(request_id, *, now)` / `abort(request_id, *, now)`：结算 /
+  释放；`reservation(request_id, *, now=None)` 查询；
+  `edge_states(*, now=None)` 返回每边 `EdgeState(edge, settled, reserved, available)`；
+  `audit(*, now=None)` 独立核对守恒
+  `balance == settled + reserved + available`（reserved 由全部 held
+  记录逐边重算），不一致抛 `AssertionError`。
+
+### 状态机与错误
+
+- 状态：`held` → `committed` / `aborted` / `expired`（后三者终态）。
+  到期判定 `now >= expires_at`；**到期与 commit 同刻时先处理到期**，
+  已过期不能复活（commit 抛错）。
+- 幂等：同 `request_id` 同参数 `prepare` 返回原状态（同一对象）；
+  同 ID 异参数抛 `ReservationConflictError`。终态上重复 commit/abort
+  是幂等 no-op，**不重复扣还余额**；反向操作（如 commit 后 abort）
+  抛 `ReservationStateError`；未知 ID 抛 `UnknownReservationError`。
+  三者均继承 `ReservationError`（进而继承 `MPSplitError`）。
+- `prepare` 失败（不可行 / 不可达）是原子的：不留下任何部分边占用；
+  失败状态同样按 ID 幂等记忆（`status="aborted"`，`failure` 含瓶颈
+  诊断）。
+- 费率取整沿用 `mp_split.fees` 的精确整数语义，本层不引入浮点。
+
+演示（真实计算，约 1 毫秒，远低于 90 秒）：
+
+```bash
+./.venv/bin/python demo_reservations.py
+```
+
+打印：prepare 占用与每边状态、瓶颈边争用拒绝、幂等重放与异参数
+拒绝、到期边界（`now == expires_at` 先到期）、abort 释放、commit
+幂等结算、不可达诊断与守恒核对。
 
 ## 目录
 
@@ -175,13 +230,17 @@ mp_split/
   model.py        Edge / Network / HopBill / PathBill / EdgeUsage / SplitResult
   fees.py         费用公式与最小实发额闭式解（纯整数）
   solver.py       简单路径枚举、分拆搜索、瓶颈诊断
+  reservations.py ReservationLedger：prepare/commit/abort、逻辑时钟到期、
+                  幂等与守恒核对
 tests/
   test_fees.py            费用数学与取整边界
   test_validation.py      输入校验（bool / NaN / 规模 / 引用）
   test_solver.py          共享瓶颈、固定费抑制拆分、无路、预算等场景
+  test_reservations.py    预留争用、abort、到期边界、不可达、幂等、守恒
   test_cross_validate.py  对独立参考的穷举交叉验证
   reference.py            独立参考实现（不导入被测核心）
 demo.py                   固定输入演示
+demo_reservations.py      预留事务演示
 ```
 
 ## 验证手段说明
