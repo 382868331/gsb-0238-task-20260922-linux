@@ -7,6 +7,9 @@
   ``edges[2].balance``。
 * :class:`SearchBudgetExhausted` —— 搜索预算耗尽，**不**代表无解；
   与“已证明无解”（``solve`` 返回 ``feasible=False``）严格区分。
+* :class:`ReservationError` 及其子类 —— 预留事务层错误：
+  `DuplicateRequestError`（同 ID 异参数）、`UnknownReservationError`
+  （未知 ID）、`ReservationStateError`（终态上的非法操作）。
 """
 
 from __future__ import annotations
@@ -34,4 +37,39 @@ class SearchBudgetExhausted(MPSplitError):
         super().__init__(
             f"search budget exhausted: {used} evaluations >= budget {budget}; "
             "this is NOT a proof of infeasibility"
+        )
+
+
+class ReservationError(MPSplitError):
+    """预留事务（prepare/commit/abort）相关的错误基类。"""
+
+
+class DuplicateRequestError(ReservationError):
+    """同一请求 ID 以不同参数重复调用。"""
+
+    def __init__(self, request_id: str) -> None:
+        self.request_id = request_id
+        super().__init__(
+            f"request_id {request_id!r}: already used with different parameters; "
+            "an id may only be retried with identical parameters"
+        )
+
+
+class UnknownReservationError(ReservationError):
+    """commit/abort 引用了不存在的请求 ID。"""
+
+    def __init__(self, request_id: str) -> None:
+        self.request_id = request_id
+        super().__init__(f"request_id {request_id!r}: no such reservation")
+
+
+class ReservationStateError(ReservationError):
+    """预留处于不允许该操作的终态（已提交/已中止/已过期/未建成）。"""
+
+    def __init__(self, request_id: str, status: str, op: str) -> None:
+        self.request_id = request_id
+        self.status = status
+        super().__init__(
+            f"request_id {request_id!r}: cannot {op} a reservation in state "
+            f"{status!r}"
         )

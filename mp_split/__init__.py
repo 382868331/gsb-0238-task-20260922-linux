@@ -4,7 +4,15 @@
 不进行任何网络访问。
 """
 
-from .errors import MPSplitError, NetworkValidationError, SearchBudgetExhausted
+from .errors import (
+    DuplicateRequestError,
+    MPSplitError,
+    NetworkValidationError,
+    ReservationError,
+    ReservationStateError,
+    SearchBudgetExhausted,
+    UnknownReservationError,
+)
 from .model import (
     Bottleneck,
     Edge,
@@ -15,15 +23,24 @@ from .model import (
     SplitResult,
 )
 from .fees import PPM_DENOM, edge_fee, min_sent_for_delivery
+from .reservations import EdgeHold, EdgeLedger, Ledger, ReservationRecord
 from .solver import solve
 
 __all__ = [
     "PPM_DENOM",
+    "DuplicateRequestError",
     "MPSplitError",
     "NetworkValidationError",
+    "ReservationError",
+    "ReservationStateError",
     "SearchBudgetExhausted",
+    "UnknownReservationError",
     "Edge",
+    "EdgeHold",
+    "EdgeLedger",
+    "Ledger",
     "Network",
+    "ReservationRecord",
     "HopBill",
     "PathBill",
     "EdgeUsage",
