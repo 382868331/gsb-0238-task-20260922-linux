@@ -7,6 +7,7 @@
 from .errors import MPSplitError, NetworkValidationError, SearchBudgetExhausted
 from .model import (
     Bottleneck,
+    CycleResult,
     Edge,
     EdgeUsage,
     HopBill,
@@ -15,7 +16,7 @@ from .model import (
     SplitResult,
 )
 from .fees import PPM_DENOM, edge_fee, min_sent_for_delivery
-from .solver import solve
+from .solver import solve, solve_cycle
 
 __all__ = [
     "PPM_DENOM",
@@ -29,7 +30,9 @@ __all__ = [
     "EdgeUsage",
     "Bottleneck",
     "SplitResult",
+    "CycleResult",
     "edge_fee",
     "min_sent_for_delivery",
     "solve",
+    "solve_cycle",
 ]

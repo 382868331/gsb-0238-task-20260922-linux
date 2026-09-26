@@ -199,3 +199,85 @@ def reference_solve(edges, n: int, s: int, t: int, D: int, max_paths: int = 3):
         return "infeasible", achievable
 
     return "ok", best_payload
+
+
+def all_simple_cycles(edges, n: int, s: int):
+    """独立 DFS 枚举 s 出发回到 s、至少两条边、中间节点不重复的简单环。
+
+    返回 [(节点元组, 边编号元组), ...]，按边编号元组排序。
+    """
+    adj = [[] for _ in range(n)]
+    for i, (u, v, *_rest) in enumerate(edges):
+        adj[u].append((v, i))
+    out = []
+
+    def dfs(u, seen, nodes, eidxs):
+        for w, ei in sorted(adj[u]):
+            if w == s:
+                out.append((tuple(nodes + [s]), tuple(eidxs + [ei])))
+            elif not seen & (1 << w):
+                dfs(w, seen | (1 << w), nodes + [w], eidxs + [ei])
+
+    dfs(s, 1 << s, [s], [])
+    out.sort(key=lambda c: c[1])
+    return out
+
+
+def cycle_table(edges, n: int, nodes, d_max: int):
+    """环即首尾相同的节点序列，逐 d 反向递推（独立二分版 min_sent）。
+
+    返回 {d: (首跳实发, [(u,v,delivered,sent),...])}，不可行 d 缺席。
+    """
+    emap = edge_lookup(edges)
+    table = {0: (0, [(u, v, 0, 0) for u, v in zip(nodes[:-1], nodes[1:])])}
+    for d in range(1, d_max + 1):
+        hops = []
+        amount = d
+        ok = True
+        for u, v in zip(reversed(nodes[:-1]), reversed(nodes[1:])):
+            bal, b, r = emap[(u, v)]
+            sent = min_sent(amount, b, r)
+            if sent is None or sent > bal:
+                ok = False
+                break
+            hops.append((u, v, amount, sent))
+            amount = sent
+        if not ok:
+            break
+        hops.reverse()
+        table[d] = (amount, hops)
+    return table
+
+
+def reference_cycle(edges, n: int, s: int, D: int):
+    """独立循环付款参考。返回 (status, payload)：
+
+    可行: ("ok", {"cost","nodes","edge_idxs","hops"})；
+    有环但余额不足: ("infeasible", max_returnable)；无环: ("no_cycle", None)。
+    """
+    cycles = all_simple_cycles(edges, n, s)
+    if not cycles:
+        return "no_cycle", None
+    best_key = None
+    best_payload = None
+    max_cap = 0
+    for nodes, eidxs in cycles:
+        tb = cycle_table(edges, n, nodes, D)
+        cap = max(tb)
+        if cap > max_cap:
+            max_cap = cap
+        if D not in tb or (D >= 1 and cap < D):
+            continue
+        cost, hops = tb[D]
+        key = (cost, len(eidxs), eidxs)
+        if best_key is None or key < best_key:
+            best_key = key
+            best_payload = {
+                "cost": cost,
+                "nodes": nodes,
+                "edge_idxs": eidxs,
+                "hops": hops,
+            }
+    if best_payload is None:
+        return "infeasible", max_cap
+    return "ok", best_payload

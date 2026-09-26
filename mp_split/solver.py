@@ -31,6 +31,7 @@ from .model import (
     MAX_DELIVERY,
     MAX_PATHS,
     Bottleneck,
+    CycleResult,
     Edge,
     EdgeUsage,
     HopBill,
@@ -669,4 +670,164 @@ def _build_result(
         None,
         D,
         evaluations,
+    )
+
+
+def _enumerate_simple_cycles(
+    adj: list[list[tuple[int, int]]], s: int
+) -> list[tuple[tuple[int, ...], tuple[int, ...]]]:
+    """枚举从 s 出发回到 s 的全部简单环（至少两条边，中间节点不重复）。
+
+    首条边是 s 的出边（其余额被减少），末条边是 s 的入边（其余额被
+    增加）；首尾同属 s 不构成零长度路径——环至少包含两条有向边。
+    返回按边编号元组字典序排序的 (节点序列, 边编号序列) 列表。
+    """
+    found: list[tuple[tuple[int, ...], tuple[int, ...]]] = []
+    node_stack = [s]
+    edge_stack: list[int] = []
+    seen = 1 << s
+
+    def dfs(u: int) -> None:
+        nonlocal seen
+        for v, ei in adj[u]:
+            if v == s:
+                # 闭合回 s：当前路径至少已有一条边，加闭合边即 >= 2 条
+                found.append((tuple(node_stack + [s]), tuple(edge_stack + [ei])))
+                continue
+            bit = 1 << v
+            if not seen & bit:
+                seen |= bit
+                node_stack.append(v)
+                edge_stack.append(ei)
+                dfs(v)
+                edge_stack.pop()
+                node_stack.pop()
+                seen ^= bit
+
+    dfs(s)
+    found.sort(key=lambda c: c[1])
+    return found
+
+
+def solve_cycle(
+    network: Network,
+    node: int,
+    amount: int,
+    *,
+    budget: int = DEFAULT_BUDGET,
+) -> CycleResult:
+    """规划一笔回到自己的循环付款（再平衡）。
+
+    从 ``node`` 出发，经过至少两条有向边回到自身：第一条边是要减
+    余额的通道（源端实发），最后一条边是要增余额的通道（最终收回）。
+    中间节点不重复（简单环）；每条有向边的余额按该边上的实际发送额
+    单独检查；费用按原整数向上取整规则从收款端反向递推。规划是只读
+    的纯函数，不修改网络余额。
+
+    参数:
+        network: 校验后的 :class:`Network`。
+        node: 出发/回收节点的原始编号。
+        amount: 最终收回金额（末跳交付额）D，``0 <= D <= 100``。
+        budget: 搜索评估上限；耗尽时抛 :class:`SearchBudgetExhausted`。
+
+    优化优先级（字典序）：
+        1. 源端实际支出（首跳实发额）最小；
+        2. 跳数最少；
+        3. 边编号（输入顺序）元组字典序最先。
+    """
+    if not isinstance(network, Network):
+        raise NetworkValidationError(
+            f"network: expected Network, got {type(network).__name__}"
+        )
+    s = network.to_internal(node, "node")
+    D = _is_real_int(amount, "amount")
+    if D < 0:
+        raise NetworkValidationError(f"amount: must be >= 0, got {D}")
+    if D > MAX_DELIVERY:
+        raise NetworkValidationError(f"amount: at most {MAX_DELIVERY}, got {D}")
+    bg = _is_real_int(budget, "budget")
+    if bg <= 0:
+        raise NetworkValidationError(f"budget: must be > 0, got {budget}")
+
+    counter = {"n": 0}
+
+    def tick() -> None:
+        counter["n"] += 1
+        if counter["n"] > bg:
+            raise SearchBudgetExhausted(counter["n"], bg)
+
+    adj = network.adjacency()
+    cycles = _enumerate_simple_cycles(adj, s)
+    if not cycles:
+        return CycleResult(
+            False,
+            None,
+            D,
+            (),
+            (),
+            Bottleneck(
+                "no_cycle",
+                f"no simple cycle with at least 2 edges from node {node} "
+                "back to itself",
+            ),
+            0,
+        )
+
+    best_key: tuple[int, int, tuple[int, ...]] | None = None
+    best_info: _PathInfo | None = None
+    max_cap = 0
+    for _nodes, edge_idxs in cycles:
+        tick()
+        info = _build_path_info(network, _nodes, edge_idxs, D)
+        if info is None:
+            continue
+        if info.cap > max_cap:
+            max_cap = info.cap
+        if info.cap < D:
+            continue
+        cost = info.table[D][0]
+        key = (cost, len(edge_idxs), edge_idxs)
+        if best_key is None or key < best_key:
+            best_key = key
+            best_info = info
+
+    if best_info is None:
+        detail = (
+            f"returnable at most {max_cap} of {D} around any simple cycle "
+            f"from {node}; each directed edge balance is charged on the "
+            f"actual sent amount (delivered + fee b + ceil(x*r/1e6))"
+        )
+        return CycleResult(
+            False,
+            None,
+            D,
+            (),
+            (),
+            Bottleneck("insufficient_balance", detail),
+            counter["n"],
+        )
+
+    _, hops = best_info.table[D]
+    if D == 0:
+        # 表内 d=0 不存逐跳记录；补零金额跳（费用为 0，不占用余额）
+        hops = [(ei, 0, 0) for ei in best_info.edge_idxs]
+    hop_bills: list[HopBill] = []
+    for ei, delivered, sent in hops:
+        ie = network.edges[ei]
+        out_edge = Edge(
+            network.to_label(ie.src),
+            network.to_label(ie.dst),
+            ie.balance,
+            ie.base_fee,
+            ie.ppm,
+        )
+        hop_bills.append(HopBill(out_edge, delivered, sent - delivered, sent))
+    return CycleResult(
+        True,
+        hop_bills[0].sent,
+        D,
+        tuple(network.to_label(v) for v in best_info.nodes),
+        tuple(hop_bills),
+        None,
+        counter["n"],
     )

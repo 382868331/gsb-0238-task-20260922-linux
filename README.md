@@ -5,9 +5,26 @@
 简单路径上求非负整数分拆，使**源总支付最小**，并返回逐跳账单与每条
 边的累计占用；无解时返回可定位的瓶颈诊断。不连接任何网络。
 
+增量能力：**循环付款规划**（`solve_cycle`）——从指定节点出发，经过
+至少两条边回到自身（首边减余额、末边增余额的通道再平衡），给定最终
+收回金额，求**源端实际支出最小**的简单环，逐跳返回实发/转发/费用；
+规划是只读的，不修改网络余额。
+
 - **Python 版本**：Python 3.14.7（仅用标准库；3.10+ 应也可运行，未逐一验证）
 - **依赖**：无第三方依赖，无需安装任何包
 - **网络/密钥/数据库/中间件/Docker**：均不需要
+
+## 环境准备（隔离 venv）
+
+不需要任何第三方包，隔离虚拟环境只是为了与系统 Python 隔离：
+
+```bash
+python3 -m venv .venv
+. .venv/bin/activate
+python -m unittest discover -s tests -v   # 跑全部测试
+python demo_iteration.py                  # 循环付款演示（< 90 秒，实测 < 0.1 秒）
+python demo.py                            # 多路径分拆演示
+```
 
 ## 费用模型（本题契约的数学子集）
 
@@ -110,6 +127,45 @@ result = solve(net, source=0, destination=2, delivery=60,
   发送额计）不足；`detail` 给出“至多可交付 X of D”的精确上界，例如
   `deliverable at most 74 of 100 with up to 3 simple paths; ...`。
 
+## 循环付款规划（solve_cycle）
+
+从指定节点出发规划一笔回到自己的循环付款（通道再平衡）：路径是经过
+**至少两条边**的简单环，第一条边是要**减余额**的通道（源端实发），
+最后一条边是要**增余额**的通道（最终收回）。中间节点不重复；首尾同
+属一个节点不算零长度路径（必须真走至少两条有向边）。费用仍按原整数
+向上取整规则（`fee = b + ceil(x*r/1e6)`）从收款端反向递推；每条有向
+边的余额按该边上的实际发送额**单独**检查；规划不修改网络余额。
+
+```python
+from mp_split import solve_cycle
+
+result = solve_cycle(net, node=0, amount=60, budget=20_000_000)
+```
+
+- `node`：出发/回收节点的原始编号；`amount`：最终收回金额
+  `0 <= D <= 100`；`budget` 语义与 `solve` 相同。
+- 优化优先级（字典序）：**源端实际支出（首跳实发额）最小** →
+  **跳数最少** → **边编号（输入顺序）元组字典序最先**。
+
+返回值 `CycleResult`（不可变值对象）：
+
+| 字段 | 含义 |
+|---|---|
+| `feasible` / `bottleneck` | 是否可行 / 不可行原因 |
+| `source_total` | 最小源端实际支出（首跳实发额） |
+| `amount` | 最终收回金额（末跳交付额） |
+| `cycle` | 环节点序列（原始编号，首尾相同） |
+| `hops` | `HopBill` 元组，按转发顺序：`edge / delivered / fee / sent`，满足 `sent - fee == delivered` |
+| `evaluations` | 搜索评估计数（可观测性） |
+
+循环付款的无解诊断：
+
+- `bottleneck.kind == "no_cycle"`：出发节点不存在任何至少两条边的
+  简单环。
+- `bottleneck.kind == "insufficient_balance"`：存在环但余额不足；
+  `detail` 给出“至多可收回 X of D”的精确上界，例如
+  `returnable at most 77 of 78 around any simple cycle from 0; ...`。
+
 ## 设计取舍
 
 1. **精确整数，不用浮点。** 费用递推、取整、余额比较全部用 Python
@@ -166,22 +222,35 @@ python demo.py
 演示打印：一个 D=60 的成功分拆（逐跳账单 + 每边余额核对）、一个
 D=100 的已证明无解瓶颈，以及一个 NaN 余额被拒绝的异常边界。
 
+循环付款演示（真实离线计算；实测 < 0.1 秒，远低于 90 秒；不依赖
+账号、密钥、sleep 或预录结果）：
+
+```bash
+python demo_iteration.py
+```
+
+演示打印：一个收回 60 的成功循环付款（逐跳实发/转发/费用 + 每边
+余额核对 + 余额未被修改核对）、一个首边手续费导致余额不足的已证明
+无解瓶颈，以及一个收回金额超限被拒绝的异常边界。
+
 ## 目录
 
 ```
 mp_split/
   __init__.py     公开接口导出
   errors.py       MPSplitError / NetworkValidationError / SearchBudgetExhausted
-  model.py        Edge / Network / HopBill / PathBill / EdgeUsage / SplitResult
+  model.py        Edge / Network / HopBill / PathBill / EdgeUsage / SplitResult / CycleResult
   fees.py         费用公式与最小实发额闭式解（纯整数）
-  solver.py       简单路径枚举、分拆搜索、瓶颈诊断
+  solver.py       简单路径/简单环枚举、分拆搜索、循环付款规划、瓶颈诊断
 tests/
   test_fees.py            费用数学与取整边界
   test_validation.py      输入校验（bool / NaN / 规模 / 引用）
   test_solver.py          共享瓶颈、固定费抑制拆分、无路、预算等场景
+  test_cycle.py           循环付款：无环、首边费用超额、并列环取舍、交叉核对
   test_cross_validate.py  对独立参考的穷举交叉验证
-  reference.py            独立参考实现（不导入被测核心）
+  reference.py            独立参考实现（不导入被测核心；含简单环枚举参考）
 demo.py                   固定输入演示
+demo_iteration.py         循环付款固定输入演示
 ```
 
 ## 验证手段说明
@@ -193,3 +262,8 @@ demo.py                   固定输入演示
 与不可行上界；账单的往返自洽（`sent - fee == delivered` 等）只作
 补充断言。此外另有小 D 的密集图穷举对拍与 8 节点 16 边 D≤100 的
 上限规模自洽 fuzz（开发期运行，非交付测试的必需部分）。
+
+循环付款同样配有独立参考 `reference_cycle`（自带简单环 DFS 与
+倍增+二分费用反推，不导入被测核心）；`tests/test_cycle.py` 在
+400 个确定性随机小图上逐字段比对可行性、源端支出、环序列与逐跳
+账单，并另测不可行时“至多可收回 X”上界与参考一致。

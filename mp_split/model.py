@@ -12,6 +12,7 @@
     EdgeUsage(edge, delivered_total, fee_total, sent_total, paths)
     Bottleneck(kind, detail)
     SplitResult(feasible, ...)
+    CycleResult(feasible, ...)
 """
 
 from __future__ import annotations
@@ -215,6 +216,8 @@ class Bottleneck:
         ``"unreachable"``        —— 源到收款端不存在任何简单路径
         ``"insufficient_balance"`` —— 存在路径，但余额（按实际发送额
             计）不足以交付 D；``detail`` 给出收紧后的最小边容量说明
+        ``"no_cycle"``           —— （循环付款）出发节点不存在任何
+            至少两条边的简单环
     """
 
     kind: str
@@ -238,4 +241,26 @@ class SplitResult:
     edge_usages: tuple[EdgeUsage, ...]
     bottleneck: Bottleneck | None
     delivery: int
+    evaluations: int
+
+
+@dataclass(frozen=True)
+class CycleResult:
+    """循环付款规划结果（从指定节点出发、经至少两条边回到自身）。
+
+    可行时：``feasible=True``，``cycle`` 为原始节点编号序列（首尾相同），
+    ``hops`` 按转发顺序给出每跳 ``HopBill``（实发 ``sent``、下游收到
+    ``delivered``、费用 ``fee``，满足 ``sent - fee == delivered``）；
+    ``source_total`` 为首跳实发额（源端实际支出），``amount`` 为末跳
+    交付额（最终收回金额）。规划不修改网络余额。
+    不可行时：``feasible=False`` 且带 ``bottleneck``。
+    ``evaluations`` 为搜索评估计数（可观测性，非优化目标）。
+    """
+
+    feasible: bool
+    source_total: int | None
+    amount: int
+    cycle: tuple[int, ...]
+    hops: tuple[HopBill, ...]
+    bottleneck: Bottleneck | None
     evaluations: int
