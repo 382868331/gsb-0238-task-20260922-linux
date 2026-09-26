@@ -12,6 +12,7 @@
     EdgeUsage(edge, delivered_total, fee_total, sent_total, paths)
     Bottleneck(kind, detail)
     SplitResult(feasible, ...)
+    CycleResult(feasible, ...)
 """
 
 from __future__ import annotations
@@ -238,4 +239,25 @@ class SplitResult:
     edge_usages: tuple[EdgeUsage, ...]
     bottleneck: Bottleneck | None
     delivery: int
+    evaluations: int
+
+
+@dataclass(frozen=True)
+class CycleResult:
+    """循环付款（回到自身的简单环）规划结果。
+
+    可行时：`feasible=True`，`source_paid` 为源端（即 `node` 自己）
+    在第一条边上的实际支出，`path` 为原始节点编号的环（首尾相同），
+    `hops` 按转发顺序给出每跳 `edge / delivered / fee / sent`，
+    满足 `sent - fee == delivered`，末跳 `delivered == receive`。
+    不可行时：`feasible=False` 且带 `bottleneck`（`"no_cycle"` 或
+    `"insufficient_balance"`）。规划不修改网络余额。
+    """
+
+    feasible: bool
+    source_paid: int | None
+    received: int
+    path: tuple[int, ...]
+    hops: tuple[HopBill, ...]
+    bottleneck: Bottleneck | None
     evaluations: int

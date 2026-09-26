@@ -81,6 +81,56 @@ result = solve(net, source=0, destination=2, delivery=60,
 | `bottleneck` | 不可行时的 `Bottleneck(kind, detail)` |
 | `evaluations` | 搜索评估计数（可观测性，不是优化目标） |
 
+
+## 循环付款规划（余额再平衡）
+
+通道余额不均时，节点可以把一笔钱沿一个环付给自己：第一条边是
+**要减余额**的通道，最后一条边是**要增加余额**的通道。`plan_cycle`
+只规划账单，**不修改网络余额**。
+
+```python
+from mp_split import Edge, Network, plan_cycle
+
+net = Network(
+    [
+        Edge(0, 1, balance=90, base_fee=1, ppm=0),     # 要减余额
+        Edge(1, 2, balance=50, base_fee=0, ppm=2_000),
+        Edge(2, 0, balance=80, base_fee=1, ppm=1_000), # 要增余额
+    ],
+    node_count=3,
+)
+
+result = plan_cycle(net, node=0,
+                    decrease_edge=(0, 1),   # 环的第一条边，src 必须是 node
+                    increase_edge=(2, 0),   # 环的最后一条边，dst 必须是 node
+                    receive=30)             # 最终收回金额
+```
+
+规则：
+
+- 环至少两条有向边；首边固定为 `decrease_edge`、末边固定为
+  `increase_edge`，两条边各自独立检查容量——即使 2 边环
+  （`a->b->a`）也按两条有向边分别计费，绝不把首尾同属一个节点当成
+  零长度路径。
+- 中间节点不得重复，`node` 不出现在中间（简单环）。
+- 费用沿用 `fee(x) = b + ceil(x*r/1e6)` 的整数向上取整规则，由
+  收款端向源端反向递推；每条有向边余额按该边实际发送额单独检查。
+- 优化优先级：源端实际支出（首跳 `sent`）最小 → 跳数最少 →
+  边在 `network.edges` 中的编号序列字典序最先。
+- `receive` 上限同 `delivery`：`0 <= receive <= 100`。
+
+返回值 `CycleResult`（不可变值对象）：
+
+| 字段 | 含义 |
+|---|---|
+| `feasible` | 是否存在可行环 |
+| `source_paid` | 源端（`node` 自己）在首边上的实际支出 |
+| `received` | 最终收回金额（即参数 `receive`） |
+| `path` | 环的原始节点编号序列（首尾相同） |
+| `hops` | 逐跳 `HopBill`（转发顺序）：`edge / delivered / fee / sent`，满足 `sent - fee == delivered` |
+| `bottleneck` | 不可行时的 `Bottleneck`：`"no_cycle"`（不存在经过指定首/末边的简单环）或 `"insufficient_balance"`（环存在但费用倒推后容量不足） |
+| `evaluations` | 评估的候选环数 |
+
 ### 优化优先级（字典序目标）
 
 1. 源总支付最小；
@@ -150,6 +200,19 @@ result = solve(net, source=0, destination=2, delivery=60,
 
 ## 运行
 
+
+### 准备（隔离 venv，可选但推荐）
+
+库只用标准库，不安装任何第三方包；用 venv 仅为与系统环境隔离：
+
+```bash
+python3.14 -m venv .venv
+. .venv/bin/activate
+```
+
+（仓库根目录的 `.venv` 已是按上述方式准备的 Python 3.14.7 隔离
+环境；requirements.txt 为空，无需 `pip install`。）
+
 执行测试（必要测试，含与独立参考实现的穷举交叉验证）：
 
 ```bash
@@ -166,6 +229,17 @@ python demo.py
 演示打印：一个 D=60 的成功分拆（逐跳账单 + 每边余额核对）、一个
 D=100 的已证明无解瓶颈，以及一个 NaN 余额被拒绝的异常边界。
 
+循环付款演示（真实离线计算，<1 秒，远低于 90 秒；不依赖账号、密钥、
+sleep 或预录结果）：
+
+```bash
+python demo_iteration.py
+```
+
+演示打印：余额不均网络中节点 0 的一次循环付款规划（首边减余额、
+末边增余额，逐跳实发/转发/费用 + 余额未修改确认）、一个收回 60 的
+已证明无解瓶颈，以及一个首边不从本节点出发的拒绝边界。
+
 ## 目录
 
 ```
@@ -175,13 +249,17 @@ mp_split/
   model.py        Edge / Network / HopBill / PathBill / EdgeUsage / SplitResult
   fees.py         费用公式与最小实发额闭式解（纯整数）
   solver.py       简单路径枚举、分拆搜索、瓶颈诊断
+  cycle.py        循环付款（回到自身的简单环）规划
 tests/
   test_fees.py            费用数学与取整边界
   test_validation.py      输入校验（bool / NaN / 规模 / 引用）
   test_solver.py          共享瓶颈、固定费抑制拆分、无路、预算等场景
   test_cross_validate.py  对独立参考的穷举交叉验证
+  test_cycle.py           循环付款：2 边环、无环、首边费用超额、并列环 tie-break、对拍
+  cycle_reference.py      循环付款独立参考实现（不导入被测核心）
   reference.py            独立参考实现（不导入被测核心）
 demo.py                   固定输入演示
+demo_iteration.py         循环付款固定输入演示
 ```
 
 ## 验证手段说明
@@ -193,3 +271,11 @@ demo.py                   固定输入演示
 与不可行上界；账单的往返自洽（`sent - fee == delivered` 等）只作
 补充断言。此外另有小 D 的密集图穷举对拍与 8 节点 16 边 D≤100 的
 上限规模自洽 fuzz（开发期运行，非交付测试的必需部分）。
+
+`tests/cycle_reference.py` 同样是**独立**参考：自带中间路径 DFS、
+复用 `tests/reference.py` 中形态独立的倍增+二分费用反推，穷举
+经过指定首/末边的全部简单环并按（源端实付, 跳数, 边编号序列）
+取最优。`tests/test_cycle.py` 在 256 个 4 节点子图 × 多组
+首/末边 × 多档收回金额上逐字段对拍（可行性、源端支出、环序列、
+逐跳账单），并覆盖无环可走、手续费导致首边超额、两条环并列的
+tie-break 与余额不被修改。
